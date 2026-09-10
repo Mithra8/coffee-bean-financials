@@ -443,12 +443,12 @@ def prepare_data(df):
             "Amount",
             "Balance",
             "Value",
-            "Debit",
-            "Credit",
             "Amount (₹)",
             "Amount INR"
         ]
     )
+    debit_col = detect_column(df, ["Debit", "Dr", "Debit Amount"])
+    credit_col = detect_column(df, ["Credit", "Cr", "Credit Amount"])
 
     # Find category column
     category_col = detect_column(
@@ -466,21 +466,31 @@ def prepare_data(df):
             "Could not find an Account/Description/Particulars column."
         )
 
-    if amount_col is None:
+    if amount_col is None and debit_col is None and credit_col is None:
         raise ValueError(
             "Could not find an Amount/Balance/Value column."
         )
 
     # Rename
-    df = df.rename(
-        columns={
-            account_col: "Account",
-            amount_col: "Amount"
-        }
-    )
+    rename_columns = {account_col: "Account"}
+    if amount_col is not None:
+        rename_columns[amount_col] = "Amount"
+    df = df.rename(columns=rename_columns)
 
-    # Clean amounts
-    df["Amount"] = df["Amount"].apply(clean_number)
+    if amount_col is not None:
+        df["Amount"] = df["Amount"].apply(clean_number)
+    else:
+        debit = (
+            df[debit_col].apply(clean_number)
+            if debit_col is not None
+            else pd.Series(0.0, index=df.index)
+        )
+        credit = (
+            df[credit_col].apply(clean_number)
+            if credit_col is not None
+            else pd.Series(0.0, index=df.index)
+        )
+        df["Amount"] = debit - credit
 
     # Category
     if category_col is not None:
