@@ -5,6 +5,8 @@ import plotly.express as px
 from io import BytesIO
 from PIL import Image
 import re
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 # OCR is optional
 try:
@@ -279,6 +281,19 @@ def categorize_account(account):
     ]):
         return "COGS"
 
+    # Depreciation and amortization are kept separate so they can be
+    # highlighted as non-cash adjustments in exported statements.
+    if "depreciation" in account:
+        return "Depreciation"
+
+    if any(x in account for x in [
+        "amortization",
+        "amortisation",
+        "intangible write off",
+        "deferred expense"
+    ]):
+        return "Amortization"
+
     # Operating expenses
     if any(x in account for x in [
         "salary",
@@ -295,10 +310,6 @@ def categorize_account(account):
         "selling expense"
     ]):
         return "Operating Expense"
-
-    # Depreciation
-    if "depreciation" in account:
-        return "Depreciation"
 
     # Interest
     if any(x in account for x in [
@@ -373,6 +384,7 @@ def get_sample_financial_data():
             "Rent",
             "Marketing",
             "Depreciation",
+            "Amortization",
             "Interest Expense",
             "Cash",
             "Accounts Receivable",
@@ -388,6 +400,7 @@ def get_sample_financial_data():
             60000,
             35000,
             20000,
+            10000,
             15000,
             400000,
             200000,
@@ -484,9 +497,19 @@ def prepare_data(df):
 
     else:
 
-        df["Category"] = df["Account"].apply(
-            categorize_account
-        )
+        df["Category"] = df["Account"].apply(categorize_account)
+
+    # Account text is a reliable signal for non-cash adjustments even when
+    # an uploaded category column contains a broad expense classification.
+    account_text = df["Account"].map(normalize_text)
+    df.loc[account_text.str.contains("depreciation"), "Category"] = "Depreciation"
+    df.loc[
+        account_text.str.contains(
+            "amortization|amortisation|intangible write off|deferred expense",
+            regex=True
+        ),
+        "Category"
+    ] = "Amortization"
 
     return df
 
@@ -514,6 +537,7 @@ def calculate_financials(df):
     cogs = total("COGS")
     opex = total("Operating Expense")
     depreciation = total("Depreciation")
+    amortization = total("Amortization")
     interest = total("Interest")
     tax = total("Tax")
 
@@ -527,6 +551,7 @@ def calculate_financials(df):
         gross_profit
         - opex
         - depreciation
+        - amortization
     )
 
     profit_before_tax = (
@@ -548,6 +573,7 @@ def calculate_financials(df):
         "cogs": cogs,
         "opex": opex,
         "depreciation": depreciation,
+        "amortization": amortization,
         "interest": interest,
         "tax": tax,
         "assets": assets,
@@ -575,6 +601,7 @@ def create_income_statement(fin):
             "Gross Profit",
             "Operating Expenses",
             "Depreciation",
+            "Amortization",
             "Operating Income",
             "Interest Expense",
             "Profit Before Tax",
@@ -588,6 +615,7 @@ def create_income_statement(fin):
             fin["gross_profit"],
             -fin["opex"],
             -fin["depreciation"],
+            -fin["amortization"],
             fin["operating_income"],
             -fin["interest"],
             fin["profit_before_tax"],
@@ -626,6 +654,136 @@ def create_balance_sheet(fin):
             fin["balance_difference"]
         ]
     })
+
+
+def create_profit_loss(df, fin):
+    """Create a categorized trading and profit or loss account."""
+    category_totals = (
+        df.groupby("Category", dropna=False)["Amount"]
+        .sum()
+        .reindex(
+            [
+                "Revenue",
+                "COGS",
+                "Operating Expense",
+                "Depreciation",
+                "Amortization",
+                "Interest",
+                "Tax"
+            ],
+            fill_value=0
+        )
+    )
+
+    return pd.DataFrame({
+        "Section": [
+            "Income",
+            "Cost of Goods Sold",
+            "Gross Profit",
+            "Operating Expenses",
+            "Depreciation",
+            "Amortization",
+            "Operating Profit",
+            "Interest Expense",
+            "Profit Before Tax",
+            "Tax",
+            "Net Profit / (Loss)"
+        ],
+        "Amount": [
+            category_totals["Revenue"],
+            -category_totals["COGS"],
+            fin["gross_profit"],
+            -category_totals["Operating Expense"],
+            -category_totals["Depreciation"],
+            -category_totals["Amortization"],
+            fin["operating_income"],
+            -category_totals["Interest"],
+            fin["profit_before_tax"],
+            -category_totals["Tax"],
+            fin["net_income"]
+        ],
+        "Account Group": [
+            "Revenue",
+            "COGS",
+            "Subtotal",
+            "Operating Expense",
+            "Non-cash adjustment",
+            "Non-cash adjustment",
+            "Subtotal",
+            "Finance cost",
+            "Subtotal",
+            "Tax",
+            "Total"
+        ]
+    })
+
+
+def create_trial_balance(df):
+    """Map categorized source balances into a reviewable trial balance."""
+    debit_categories = {
+        "Asset",
+        "COGS",
+        "Operating Expense",
+        "Depreciation",
+        "Amortization",
+        "Interest",
+        "Tax"
+    }
+
+    trial = df[["Account", "Category", "Amount"]].copy()
+    trial["Amount"] = trial["Amount"].abs()
+    trial["Debit"] = np.where(
+        trial["Category"].isin(debit_categories),
+        trial["Amount"],
+        0.0
+    )
+    trial["Credit"] = np.where(
+        trial["Category"].isin(debit_categories),
+        0.0,
+        trial["Amount"]
+    )
+    trial["Nature"] = np.where(
+        trial["Category"].isin(debit_categories),
+        "Debit",
+        "Credit"
+    )
+
+    total_row = pd.DataFrame([{
+        "Account": "TOTAL",
+        "Category": "",
+        "Amount": trial["Amount"].sum(),
+        "Debit": trial["Debit"].sum(),
+        "Credit": trial["Credit"].sum(),
+        "Nature": ""
+    }])
+    return pd.concat([trial, total_row], ignore_index=True)
+
+
+def create_category_summary(df):
+    summary = (
+        df.groupby("Category", dropna=False)
+        .agg(
+            Accounts=("Account", "count"),
+            Total=("Amount", "sum")
+        )
+        .reset_index()
+        .sort_values("Total", ascending=False)
+    )
+    return summary
+
+
+def create_final_accounts(profit_loss, balance):
+    """Place final accounts into one compact management-ready sheet."""
+    profit = profit_loss[["Section", "Amount"]].rename(
+        columns={"Section": "Profit & Loss", "Amount": "P&L Amount"}
+    )
+    position = balance.rename(
+        columns={"Particulars": "Balance Sheet", "Amount": "Balance Amount"}
+    )
+    rows = max(len(profit), len(position))
+    profit = profit.reindex(range(rows))
+    position = position.reindex(range(rows))
+    return pd.concat([profit, position], axis=1)
 
 
 # ============================================================
@@ -678,38 +836,124 @@ def create_ratios(fin):
 # EXCEL EXPORT
 # ============================================================
 
-def create_excel(df, income, balance, ratios):
+def _style_worksheet(ws, title_rows=1, money_columns=None, highlight_terms=None):
+    palette = {
+        "brown": "5D3B2E",
+        "gold": "D29A58",
+        "cream": "FFF7EE",
+        "ink": "2D1E1A",
+        "line": "E6D4C2",
+        "green": "E1F2E8",
+        "yellow": "FFF0C2",
+        "blue": "E4EFF8",
+    }
+    thin = Side(style="thin", color=palette["line"])
+    header_fill = PatternFill("solid", fgColor=palette["brown"])
+    section_fill = PatternFill("solid", fgColor=palette["gold"])
+    adjustment_fill = PatternFill("solid", fgColor=palette["yellow"])
 
+    ws.freeze_panes = f"A{title_rows + 1}"
+    ws.sheet_view.showGridLines = False
+    ws.auto_filter.ref = ws.dimensions
+
+    for cell in ws[title_rows]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = Border(bottom=thin)
+
+    for row in ws.iter_rows(min_row=title_rows + 1):
+        for cell in row:
+            cell.border = Border(bottom=thin)
+            cell.alignment = Alignment(vertical="center")
+            if isinstance(cell.value, (int, float)) and money_columns:
+                if cell.column in money_columns:
+                    cell.number_format = '#,##0.00;[Red](#,##0.00)'
+
+    for row in ws.iter_rows(min_row=title_rows + 1):
+        label = " ".join(
+            str(cell.value or "") for cell in row[: min(3, ws.max_column)]
+        ).lower()
+        if "total" in label or "profit" in label or "income" in label:
+            for cell in row:
+                cell.fill = PatternFill("solid", fgColor=palette["green"])
+                cell.font = Font(bold=True, color=palette["ink"])
+        if highlight_terms and any(term in label for term in highlight_terms):
+            for cell in row:
+                cell.fill = adjustment_fill
+                cell.font = Font(bold=True, color=palette["ink"])
+
+    for column_cells in ws.columns:
+        column_letter = get_column_letter(column_cells[0].column)
+        max_length = max(
+            len(str(cell.value or ""))
+            for cell in column_cells
+        )
+        ws.column_dimensions[column_letter].width = min(max(max_length + 3, 12), 32)
+
+    ws.row_dimensions[title_rows].height = 26
+
+
+def create_excel(df, income, balance, ratios, fin):
     output = BytesIO()
 
     with pd.ExcelWriter(
         output,
         engine="openpyxl"
     ) as writer:
+        trial_balance = create_trial_balance(df)
+        profit_loss = create_profit_loss(df, fin)
+        category_summary = create_category_summary(df)
+        final_accounts = create_final_accounts(profit_loss, balance)
 
-        df.to_excel(
-            writer,
-            sheet_name="Processed Data",
-            index=False
-        )
+        sheets = {
+            "Processed Data": df,
+            "Trial Balance": trial_balance,
+            "Profit & Loss": profit_loss,
+            "Final Accounts": final_accounts,
+            "Balance Sheet": balance,
+            "Income Statement": income,
+            "Category Summary": category_summary,
+            "Ratios": ratios,
+        }
 
-        income.to_excel(
-            writer,
-            sheet_name="Income Statement",
-            index=False
-        )
+        for sheet_name, data in sheets.items():
+            data.to_excel(writer, sheet_name=sheet_name, index=False)
 
-        balance.to_excel(
-            writer,
-            sheet_name="Balance Sheet",
-            index=False
-        )
+        workbook = writer.book
+        readme = workbook.create_sheet("Read Me", 0)
+        readme.append(["COFFEE BEAN | FINANCIAL REPORT"])
+        readme.append(["Workbook purpose", "Automated financial statements from categorized account data"])
+        readme.append(["Generated sheets", ", ".join(sheets.keys())])
+        readme.append(["Highlight key", "Gold rows = depreciation/amortization adjustments; green rows = totals and subtotals"])
+        readme.append(["Trial balance note", "Debit/Credit mapping is inferred from account categories and should be reviewed before filing"])
+        readme["A1"].fill = PatternFill("solid", fgColor="5D3B2E")
+        readme["A1"].font = Font(color="FFFFFF", bold=True, size=14)
+        readme.merge_cells("A1:B1")
+        readme.column_dimensions["A"].width = 24
+        readme.column_dimensions["B"].width = 110
+        readme.sheet_view.showGridLines = False
+        readme.freeze_panes = "A2"
 
-        ratios.to_excel(
-            writer,
-            sheet_name="Ratios",
-            index=False
-        )
+        for sheet_name in sheets:
+            ws = workbook[sheet_name]
+            money_columns = [
+                cell.column
+                for cell in ws[1]
+                if str(cell.value).lower() in {
+                    "amount",
+                    "p&l amount",
+                    "balance amount",
+                    "debit",
+                    "credit",
+                    "total"
+                }
+            ]
+            _style_worksheet(
+                ws,
+                money_columns=money_columns,
+                highlight_terms=["depreciation", "amortization", "amortisation"]
+            )
 
     return output.getvalue()
 
@@ -955,6 +1199,7 @@ def process_dataframe(df_raw, source_name, currency):
         "COGS",
         "Operating Expense",
         "Depreciation",
+        "Amortization",
         "Interest",
         "Tax",
         "Asset",
@@ -1020,6 +1265,25 @@ def process_dataframe(df_raw, source_name, currency):
     st.header("📊 Financial Ratios")
     st.dataframe(ratios, use_container_width=True, hide_index=True)
 
+    st.header("📚 Complete Accounting Reports")
+    st.caption(
+        "Coffee Bean infers debit/credit nature from the account category. "
+        "Review the trial balance before using it for statutory filing."
+    )
+    trial_balance = create_trial_balance(df)
+    profit_loss = create_profit_loss(df, fin)
+    final_accounts = create_final_accounts(profit_loss, balance_sheet)
+
+    report_tab1, report_tab2, report_tab3 = st.tabs(
+        ["Trial Balance", "Profit & Loss Account", "Final Accounts"]
+    )
+    with report_tab1:
+        st.dataframe(trial_balance, use_container_width=True, hide_index=True)
+    with report_tab2:
+        st.dataframe(profit_loss, use_container_width=True, hide_index=True)
+    with report_tab3:
+        st.dataframe(final_accounts, use_container_width=True, hide_index=True)
+
     chart_data = pd.DataFrame({
         "Metric": ["Revenue", "Gross Profit", "Operating Income", "Net Income"],
         "Amount": [
@@ -1045,7 +1309,13 @@ def process_dataframe(df_raw, source_name, currency):
     st.plotly_chart(fig2, use_container_width=True)
 
     st.header("📥 Export")
-    excel_data = create_excel(df, income_statement, balance_sheet, ratios)
+    excel_data = create_excel(
+        df,
+        income_statement,
+        balance_sheet,
+        ratios,
+        fin
+    )
     st.download_button(
         label="📥 Download Complete Excel Report",
         data=excel_data,
