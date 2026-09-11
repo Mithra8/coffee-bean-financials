@@ -5,6 +5,7 @@ import plotly.express as px
 from io import BytesIO
 from PIL import Image
 import re
+from pathlib import Path
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -14,6 +15,22 @@ try:
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
+
+
+def find_tesseract_path():
+    candidates = [
+        Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+        Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+TESSERACT_PATH = find_tesseract_path()
+if OCR_AVAILABLE and TESSERACT_PATH:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 
 # ============================================================
@@ -1017,18 +1034,28 @@ with st.sidebar:
 
     if OCR_AVAILABLE:
 
+        if TESSERACT_PATH:
+            st.success(f"Tesseract detected: {TESSERACT_PATH}")
+        else:
+            st.warning(
+                "Tesseract OCR engine was not found automatically. "
+                "Enter its full executable path below."
+            )
+
         tesseract_path = st.text_input(
             "Tesseract path (optional)",
+            value=TESSERACT_PATH or "",
             placeholder="C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
         )
 
         if tesseract_path:
-            try:
-                pytesseract.pytesseract.tesseract_cmd = (
-                    tesseract_path
+            configured_path = Path(tesseract_path.strip())
+            if configured_path.is_file():
+                pytesseract.pytesseract.tesseract_cmd = str(configured_path)
+            else:
+                st.error(
+                    f"Tesseract executable was not found at: {configured_path}"
                 )
-            except Exception:
-                pass
 
     else:
 
